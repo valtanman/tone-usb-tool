@@ -1,0 +1,178 @@
+#!/bin/bash
+# 管理者権限で動く部分。対象は引数で渡す(ファイル名の引用符問題が起きない)。
+#   usb-root flash ISO DEV SIZE_BYTES SERIAL            書き込み前に簡易消去→dd→SHA-256で検証
+#   usb-root wipe  DEV quick|full SIZE_BYTES SERIAL [any]   強制真っ白(any = USBではない内蔵ディスクも許す。画面側で全体名の入力確認済みのとき)
+# 守り: いま動いているシステム(/ /boot /boot/efi /usr /var とライブ媒体)を支えるディスクと、ISOが入っているディスクは、何があっても受け付けない。
+#       選んだ後に入れ替わっていないか調べ直す。強制: 使用中でも外し、書き込み禁止の表示は解除を試し、消えたかを読み直して確かめる。
+set -u
+act=${1:-}; shift || true
+test_mode=${TONE_USB_TEST:-}
+# 文言は出さない。「@@コード|値|値」だけを出し、表示は画面側が言語ファイルで翻訳する(rootの処理に言語ファイルを読み込ませないため)
+die() { echo "@@$1" >&2; exit "${2:-1}"; }
+msg() { echo "@@$1"; }
+disks_of() { lsblk -slnpo NAME,TYPE "$1" 2>/dev/null | awk '$2=="disk"{print $1}'; }
+src_of() { findmnt -n -o SOURCE "$@" 2>/dev/null | sed 's/\[.*//' | head -1; }
+sysdisks() { local mp s; for mp in / /boot /boot/efi /usr /var /cdrom /run/live/medium /isodevice; do s=$(src_of "$mp"); [ -n "$s" ] && disks_of "$s"; done | sort -u; }
+usbish() { local d=$1 rm tran hp; rm=$(lsblk -dnno RM "$d" 2>/dev/null); tran=$(lsblk -dnno TRAN "$d" 2>/dev/null); hp=$(lsblk -dnno HOTPLUG "$d" 2>/dev/null)
+  if [ "$rm" = 1 ] || [ "$tran" = usb ] || [ "$hp" = 1 ]; then return 0; fi
+  case "$d" in /dev/mmcblk*) return 0;; esac; return 1; }
+check_target() { # DEV SIZE SERIAL ISO ANY
+  local dev=$1 size=$2 serial=$3 iso=${4:-} any=${5:-}
+  if [ ! -b "$dev" ]; then   # テスト専用(TONE_USB_TEST=1)のときだけ、通常ファイルを対象にできる
+    [ -n "$test_mode" ] && [ -f "$dev" ] || {
+      if [ -e "$dev" ]; then die "E_PLAINFILE|$dev" 3
+      else die "E_NODEV|$dev" 3; fi; }
+    [ "$(stat -c %s "$dev")" = "$size" ] || die "E_SIZECHG" 7
+    return 0
+  fi
+  [ "$(lsblk -dnno TYPE "$dev" 2>/dev/null)" = disk ] || { [ -n "$test_mode" ] && [ "$(lsblk -dnno TYPE "$dev" 2>/dev/null)" = loop ]; } || die "E_NOTDISK|$dev" 3
+  if sysdisks | grep -qx "$dev"; then die "E_SYSDISK" 6; fi
+  if [ -n "$iso" ]; then local id; id=$(src_of -T "$iso"); [ -z "$id" ] || ! disks_of "$id" | grep -qx "$dev" || die "E_ISODISK" 6; fi
+  if [ "$any" != any ] && [ -z "$test_mode" ]; then usbish "$dev" || die "E_NOTUSB|$dev" 6; fi
+  [ "$(blockdev --getsize64 "$dev" 2>/dev/null)" = "$size" ] || die "E_SIZECHG" 7
+  [ "$(lsblk -dnno SERIAL "$dev" 2>/dev/null)" = "$serial" ] || die "E_SERIALCHG" 7
+}
+# 自分(と、この処理を起動した親: 画面・端末)は、何があっても終了させない
+ancestors() { local p=$$ q; while [ -n "$p" ] && [ "$p" -gt 1 ]; do echo "$p"; q=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null); [ "$q" = "$p" ] && break; p=$q; done; }
+kill_users() { # マウント先を使っているプロセスを、止められるものだけ止める(終了を頼み、残れば強制)
+  local mp=$1 pid comm keep sig
+  keep=" $(ancestors | tr '\n' ' ')$PPID "
+  for sig in TERM KILL; do
+    for pid in $(fuser -m "$mp" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$'); do
+      case "$keep" in *" $pid "*) continue;; esac
+      comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+      case "$comm" in tone-usb-flash|zenity|kdialog|pkexec|polkit*|Xorg|Xwayland|gnome-shell|plasmashell|kwin*|systemd|sddm*|gdm*|lightdm|login) continue;; esac
+      kill -"$sig" "$pid" 2>/dev/null
+    done
+    sleep 1
+  done
+}
+# 強制解放: スワップ・暗号化/LVM/RAID・マウントを、使っているものごと外す(外せなくても先へ進み、最後に消えたかを確かめる)
+force_release() {
+  local dev=$1 p t mp
+  [ -b "$dev" ] || return 0
+  while read -r p; do grep -q "^$p " /proc/swaps 2>/dev/null && swapoff "$p" 2>/dev/null; done < <(lsblk -lnpo NAME "$dev" 2>/dev/null)
+  while read -r p; do
+    findmnt -rn -S "$p" -o TARGET 2>/dev/null | while IFS= read -r mp; do
+      mp=$(printf '%b' "$mp")
+      umount "$mp" 2>/dev/null || { kill_users "$mp"; umount -f "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true; }
+    done
+  done < <(lsblk -lnpo NAME "$dev" 2>/dev/null | tac)
+  while read -r p t; do
+    case "$t" in
+      crypt) cryptsetup close "$p" 2>/dev/null || dmsetup remove -f "$p" 2>/dev/null || true;;
+      lvm|dm) dmsetup remove -f "$p" 2>/dev/null || true;;
+      raid*) mdadm --stop "$p" 2>/dev/null || true;;
+    esac
+  done < <(lsblk -lnpo NAME,TYPE "$dev" 2>/dev/null | tac)
+  sync; udevadm settle >/dev/null 2>&1 || true
+}
+# 書き込み可能にする。カーネルは、開いているパーティション(マウント中など)があると読み取り専用の解除を断るので、必ず force_release のあとに呼ぶ
+make_writable() {
+  local dev=$1 b sysb=${TONE_SYSBLOCK:-/sys/block}
+  [ -b "$dev" ] || [ -n "${TONE_SYSBLOCK:-}" ] || return 0
+  b=$(basename "$dev")
+  ro() { cat "$sysb/$b/ro" 2>/dev/null; }
+  for _ in 1 2 3; do
+    [ "$(ro)" = 0 ] && return 0
+    blockdev --setrw "$dev" >/dev/null 2>&1 || true; sleep 1
+  done
+  [ "$(ro)" = 0 ] && return 0
+  # それでも駄目なら、機器の状態を読み直させて(書き込み禁止の表示を再確認)、もう一度解除する
+  [ -w "$sysb/$b/device/rescan" ] && echo 1 > "$sysb/$b/device/rescan" 2>/dev/null; sleep 2
+  for _ in 1 2; do blockdev --setrw "$dev" >/dev/null 2>&1 || true; sleep 1; [ "$(ro)" = 0 ] && return 0; done
+  local why; why=$(dmesg 2>/dev/null | grep -i "\[$b\].*Write Protect is" | tail -n 1)
+  die "E_ROSTUCK|${why:-}|$dev" 4
+}
+blank_ends() { # 先頭と末尾の4MiB(小さい物は1MiB)がすべてゼロか
+  local dev=$1 size n; size=$(blockdev --getsize64 "$dev" 2>/dev/null || stat -c %s "$dev"); n=4194304; [ "$size" -lt 16777216 ] && n=1048576
+  [ "$(head -c $n "$dev" 2>/dev/null | tr -d '\0' | wc -c)" = 0 ] && [ "$(tail -c $n "$dev" 2>/dev/null | tr -d '\0' | wc -c)" = 0 ]
+}
+# デバイスの実体(/dev の名前)が一瞬消えることがある(USBの再認識)。戻るまで待ち、戻らなければ書かずに止める
+wait_node() {
+  local dev=$1
+  [ -n "$test_mode" ] && [ ! -b "$dev" ] && return 0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -b "$dev" ] && return 0; udevadm settle >/dev/null 2>&1 || true; sleep 1; done
+  udevadm trigger --subsystem-match=block --action=add >/dev/null 2>&1 || true; udevadm settle >/dev/null 2>&1 || true; sleep 2
+  [ -b "$dev" ] || die "E_GONE|$dev" 10
+}
+quick_wipe() { # 署名・パーティション表・先頭と末尾をゼロ埋め(消えていなければ直接書き込みでやり直す)
+  local dev=$1 size mb tail_off; size=$(blockdev --getsize64 "$dev" 2>/dev/null || stat -c %s "$dev")
+  mb=4; [ "$size" -lt 16777216 ] && mb=1
+  wipefs -a -f "$dev" >/dev/null 2>&1 || true
+  command -v sgdisk >/dev/null && sgdisk --zap-all "$dev" >/dev/null 2>&1 || true
+  for _ in 1 2; do
+    wait_node "$dev"
+    dd if=/dev/zero of="$dev" bs=1M count=$mb conv=nocreat,fsync,notrunc status=none 2>/dev/null
+    tail_off=$(( size / 1048576 - mb )); [ "$tail_off" -gt 0 ] && dd if=/dev/zero of="$dev" bs=1M seek="$tail_off" count=$mb conv=nocreat,fsync,notrunc status=none 2>/dev/null
+    sync; blockdev --flushbufs "$dev" >/dev/null 2>&1 || true
+    blank_ends "$dev" && break
+    [ -b "$dev" ] && { force_release "$dev"; wipefs -a -f "$dev" >/dev/null 2>&1 || true; }
+  done
+  blockdev --rereadpt "$dev" >/dev/null 2>&1 || true; udevadm settle >/dev/null 2>&1 || true
+}
+# ISOの隣の .sha256(または SHA256SUMS)があれば、書く前に照合する。無ければ何もしない
+iso_check() {
+  local iso=$1 d f want have base; d=$(dirname "$iso"); base=$(basename "$iso")
+  for f in "$iso.sha256" "$iso.sha256sum" "${iso%.*}.sha256" "$d/SHA256SUMS"; do
+    [ -r "$f" ] || continue
+    want=$(grep -F "$base" "$f" 2>/dev/null | head -n 1 | awk '{print $1}')
+    [ -z "$want" ] && [ "$(wc -l < "$f")" -le 1 ] && want=$(awk '{print $1}' "$f" | head -n 1)
+    [ -n "$want" ] || continue
+    msg "M_ISOCHK|${f##*/}"; have=$(sha256sum < "$iso" | cut -d' ' -f1)
+    [ "$want" = "$have" ] || die "E_ISOBAD|${f##*/}" 3
+    msg "M_ISOOK"; return 0
+  done
+  msg "M_ISONOCHK"
+}
+eject_dev() { # 安全な取り外し(電源も落とす)。できなくても失敗にはしない
+  local dev=$1
+  sync; force_release "$dev" >/dev/null 2>&1 || true
+  [ -b "$dev" ] || { msg "M_SYNCED"; return 0; }
+  if command -v udisksctl >/dev/null 2>&1 && udisksctl power-off -b "$dev" >/dev/null 2>&1; then msg "M_EJECTED_OFF"
+  elif command -v eject >/dev/null 2>&1 && eject "$dev" >/dev/null 2>&1; then msg "M_EJECTED"
+  else msg "M_EJECT_MANUAL"; fi
+}
+case "$act" in
+  flash)
+    iso=${1:-}; dev=${2:-}; size=${3:-}; serial=${4:-}; shift 4 2>/dev/null || true; opts=" $* "
+    [ -n "$iso" ] && [ -n "$dev" ] && [ -n "$size" ] || die "E_NOARGS3|$iso|$dev|$size" 2
+    [ "$serial" = - ] && serial=""
+    [ -r "$iso" ] && [ -s "$iso" ] || die "E_ISOREAD|$iso" 2
+    check_target "$dev" "$size" "$serial" "$iso" ""
+    msg "M_S1"; iso_check "$iso"
+    msg "M_S2"; force_release "$dev"; make_writable "$dev"; sync
+    msg "M_S3"; quick_wipe "$dev"
+    case "$opts" in *" full "*) msg "M_FULL"; blkdiscard -z -f "$dev" >/dev/null 2>&1 || blkdiscard -z "$dev" >/dev/null 2>&1 || dd if=/dev/zero of="$dev" bs=4M iflag=count_bytes count="$size" conv=nocreat,fsync,notrunc status=none 2>/dev/null || true; sync;; esac
+    msg "M_S4"; wait_node "$dev"
+    dd if="$iso" of="$dev" bs=4M conv=nocreat,fsync,notrunc status=progress 2>&1 | tr '\r' '\n'; [ "${PIPESTATUS[0]}" = 0 ] || die "E_WRITEFAIL" 11
+    wait_node "$dev"
+    sync; blockdev --rereadpt "$dev" >/dev/null 2>&1 || true; udevadm settle >/dev/null 2>&1 || true
+    n=$(stat -c %s "$iso"); msg "M_S5"
+    a=$(sha256sum < "$iso" | cut -d' ' -f1); b=$(head -c "$n" "$dev" | sha256sum | cut -d' ' -f1)
+    [ "$a" = "$b" ] || die "E_VERIFY" 8
+    msg "M_VERIFIED|$a"
+    case "$opts" in *" eject "*) eject_dev "$dev";; esac ;;
+  wipe)
+    dev=${1:-}; level=${2:-quick}; size=${3:-}; serial=${4:-}; any=${5:-}
+    [ -n "$dev" ] && [ -n "$size" ] || die "E_NOARGS2|$dev|$size" 2
+    [ "$serial" = - ] && serial=""
+    check_target "$dev" "$size" "$serial" "" "$any"
+    msg "M_WIPE_REL"; force_release "$dev"; make_writable "$dev"
+    msg "M_WIPE_ERASE"; quick_wipe "$dev"
+    if [ "$level" = full ]; then
+      msg "M_WIPE_FULL"
+      blkdiscard -z -f "$dev" >/dev/null 2>&1 || blkdiscard -z "$dev" >/dev/null 2>&1 || dd if=/dev/zero of="$dev" bs=4M iflag=count_bytes count="$size" conv=nocreat,fsync,notrunc status=progress 2>&1 | tr '\r' '\n' || true
+      sync
+    fi
+    [ -z "$(wipefs "$dev" 2>/dev/null)" ] || die "E_SIGLEFT" 9
+    blank_ends "$dev" || die "E_DATALEFT" 9
+    msg "M_WIPED" ;;
+  eject) eject_dev "${1:?}" ;;   # 検査用
+  isocheck) iso_check "${1:?}" ;;   # 検査用
+  makewritable) make_writable "${1:?}" ;;   # 検査用
+  killusers) kill_users "${1:?}" ;;   # 検査用
+  ancestors) ancestors ;;   # 検査用
+  sysdisks) sysdisks ;;   # 検査用: いま動いているシステムを支えるディスクの一覧
+  *) die "E_USAGE" 2 ;;
+esac

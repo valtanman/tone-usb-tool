@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=TONE USB Tool
+Name[ja]=TONE USB ツール
+Comment=Write an ISO to USB / wipe a USB drive
+Comment[ja]=ISOをUSBに書き込む/USBを真っ白にする
+Exec=/usr/local/bin/tone-usb-flash %f
+Icon=tone-usb-flash
+MimeType=application/x-cd-image;
+Categories=System;Utility;

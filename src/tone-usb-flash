@@ -1,0 +1,176 @@
+#!/bin/bash
+# TONE USB 書き込み・初期化(KDE標準の kdialog を優先。zenity は予備)
+APP="TONE USB Tool"; ROOT_HELPER=/usr/local/lib/tone-usb/usb-root
+GUI=""; for t in kdialog zenity; do command -v $t >/dev/null 2>&1 && { GUI=$t; break; }; done
+[ -n "$GUI" ] || { echo "kdialog or zenity is required / kdialog か zenity が必要です" >&2; exit 1; }
+err() { if [ $GUI = kdialog ]; then kdialog --title "$APP" --error "$1"; else zenity --error --title="$APP" --text="$1"; fi; }
+info() { if [ $GUI = kdialog ]; then kdialog --title "$APP" --msgbox "$1"; else zenity --info --title="$APP" --text="$1"; fi; }
+yn() { if [ $GUI = kdialog ]; then kdialog --title "$APP" --warningyesno "$1"; else zenity --question --title="$APP" --text="$1"; fi; }
+ask() { if [ $GUI = kdialog ]; then kdialog --title "$APP" --inputbox "$1"; else zenity --entry --title="$APP" --text="$1"; fi; }
+# ---- 言語: 言語ファイル(key=value)をデータとして読む。実行はしない。足りない文言は英語で補う ----
+declare -A TL
+load_lang() { # 1ファイル読む(コメントと不正な行は飛ばす)
+  local f=$1 line k v; [ -r "$f" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|\#*) continue;; esac
+    k=${line%%=*}; v=${line#*=}; case "$k" in ''|*[!A-Za-z0-9_]*) continue;; esac
+    v=${v//\\n/$'\n'}; TL[$k]=$v
+  done < "$f"
+}
+SELF_DIR=$(cd "$(dirname "$(readlink -f "$0")")" 2>/dev/null && pwd)
+LANG_DIRS=("${TONE_LANG_DIR:-}" "$SELF_DIR/../share/tone-usb/lang" /usr/local/share/tone-usb/lang /usr/share/tone-usb/lang "$HOME/.config/tone-usb/lang")
+pick_lang() { # 環境の言語 (ja_JP.UTF-8 → ja_JP → ja)。分からなければ英語
+  # 優先順: 環境変数 TONE_LANG → 設定ファイル ~/.config/tone-usb/language (中身は ja や en) → 環境の言語
+  local cfg="" f="$HOME/.config/tone-usb/language"; [ -r "$f" ] && cfg=$(head -n 1 "$f" | tr -dc 'A-Za-z_')
+  local raw=${TONE_LANG:-${cfg:-${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}}}; raw=${raw%%.*}; raw=${raw%%@*}
+  case "$raw" in ''|C|POSIX) echo en;; *) echo "$raw";; esac
+}
+load_all_lang() {
+  local d want base; want=$(pick_lang); base=${want%%_*}
+  for d in "${LANG_DIRS[@]}"; do [ -n "$d" ] && load_lang "$d/en.lang"; done
+  [ "$base" = en ] && return 0
+  for d in "${LANG_DIRS[@]}"; do [ -n "$d" ] || continue; load_lang "$d/$base.lang"; [ "$want" != "$base" ] && load_lang "$d/$want.lang"; done
+}
+load_all_lang
+t() { # t キー 値1 値2 …  (%1 %2 … に差し込む)
+  local k=$1 v i=1 a pat; shift; v=${TL[$k]-}; [ -n "$v" ] || v=$k
+  for a in "$@"; do pat="%$i"; v=${v//"$pat"/"$a"}; i=$((i+1)); done
+  printf '%s' "$v"
+}
+tlog() { # root側の「@@コード|値…」を翻訳して表示する。それ以外の行(dd の進み具合など)はそのまま
+  local l P
+  while IFS= read -r l; do
+    case "$l" in
+      @@*) IFS='|' read -r -a P <<<"${l#@@}"; [ "${P[0]}" = E_ROSTUCK ] && [ -z "${P[1]:-}" ] && P[1]=$(t ro_none); t "${P[@]}"; printf '\n';;
+      *) printf '%s\n' "$l";;
+    esac
+  done
+}
+ADV=0; [ -f "$HOME/.config/tone-os/usb-advanced" ] && ADV=1
+cd / || true   # 作業フォルダがUSBの中だと、USBを外すときに巻き込まれる
+ISO=${1:-}
+disks_of() { lsblk -slnpo NAME,TYPE "$1" 2>/dev/null | awk '$2=="disk"{print $1}'; }
+src_of() { findmnt -n -o SOURCE "$@" 2>/dev/null | sed 's/\[.*//' | head -1; }
+# いま動いているシステムを支えるディスク(起動ディスク・ライブ媒体)。これだけは、どの操作でも出さない
+SYS=$(for mp in / /boot /boot/efi /usr /var /cdrom /run/live/medium /isodevice; do s=$(src_of "$mp"); [ -n "$s" ] && disks_of "$s"; done | sort -u)
+ISOD=""; [ -n "$ISO" ] && { s=$(src_of -T "$ISO"); [ -n "$s" ] && ISOD=$(disks_of "$s"); }
+key() { printf '%s\n' "$2" | sed -n "s/.*\b$1=\"\([^\"]*\)\".*/\1/p"; }   # evalを使わずに値を取り出す
+# 全ディスクを調べ、1行ずつ  デバイス|容量|型番|シリアル|接続|種別|除外理由  で出す
+#   種別: usb=USB/SD/リムーバブル  hdd=容量500GB以上でUSB接続の回転式(外付けHDD)  int=それ以外(内蔵)
+#   ※ USBメモリが「回転式」と報告されることは普通にあるので、回転式だけでは外さない
+scan() {
+  lsblk -bdnP -o KNAME,TYPE,SIZE,RM,TRAN,MODEL,ROTA,SERIAL,HOTPLUG 2>/dev/null | while IFS= read -r l; do
+    kn=$(key KNAME "$l"); ty=$(key TYPE "$l"); by=$(key SIZE "$l"); rmv=$(key RM "$l"); tr=$(key TRAN "$l")
+    md=$(key MODEL "$l"); ro=$(key ROTA "$l"); sr=$(key SERIAL "$l"); hp=$(key HOTPLUG "$l"); dv="/dev/$kn"
+    [ "$ty" = disk ] || continue
+    [ "${by:-0}" -gt 0 ] 2>/dev/null || continue; [[ $kn == zram* ]] && continue   # 容量0・圧縮メモリは対象外
+    szh=$(numfmt --to=iec "${by:-0}" 2>/dev/null || echo "${by}B")
+    kind=int
+    if [ "$rmv" = 1 ] || [ "$tr" = usb ] || [ "$hp" = 1 ] || [[ $kn == mmcblk* ]]; then
+      kind=usb; [ "$ro" = 1 ] && [ "${by:-0}" -ge 500000000000 ] && kind=hdd
+    fi
+    why=""
+    printf '%s\n' "$SYS" | grep -qx "$dv" && why=$(t why_system)
+    [ -z "$why" ] && [ -n "$ISOD" ] && printf '%s\n' "$ISOD" | grep -qx "$dv" && why=$(t why_isodisk)
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$dv" "$szh" "${md:-}" "$sr" "${tr:--}" "$kind" "$why" "$by"
+  done
+}
+pick() { # $1: flash | wipe | all
+  scan | while IFS= read -r l; do
+    IFS='|' read -r p s m sr t kind why bytes <<<"$l"; [ -z "$why" ] || continue
+    case "$1:$kind" in flash:usb) ;; flash:hdd) [ "$ADV" = 1 ] || continue;; wipe:usb|wipe:hdd) ;; all:*) ;; *) continue;; esac
+    printf '%s\n' "$l"
+  done
+}
+explain() { # 見つかったディスクと、候補にならなかった理由
+  scan | while IFS='|' read -r p s m sr t kind why bytes; do
+    if [ -n "$why" ]; then r=$(t exp_excluded "$why")
+    elif [ "$kind" = int ]; then r=$(t exp_notusb)
+    elif [ "$kind" = hdd ]; then r=$(t exp_bighdd)
+    else r=$(t exp_cand); fi
+    t exp_line "$p" "$s" "${m:-$(t unknown)}" "$r"; printf '\n'
+  done
+}
+kindname() { case "$1" in usb) t kind_usb;; hdd) t kind_hdd;; *) t kind_int;; esac; }
+MC=$(t menu_combo); MF=$(t menu_flash); MW=$(t menu_wipe)
+mode=$( if [ $GUI = kdialog ]; then kdialog --title "$APP" --menu "$(t menu_title)" combo "$MC" flash "$MF" wipe "$MW"; else zenity --list --title="$APP" --column=id --column="$(t col_op)" --hide-column=1 --print-column=1 combo "$MC" flash "$MF" wipe "$MW"; fi ) || exit 0
+COMBO=0; [ "$mode" = combo ] && { COMBO=1; mode=flash; }
+if [ "$mode" = flash ] && [ -z "$ISO" ]; then
+  if [ $GUI = kdialog ]; then ISO=$(kdialog --getopenfilename "$HOME" "*.iso|$(t iso_filter)" --title "$(t pick_iso)") || exit 0
+  else ISO=$(zenity --file-selection --title="$(t pick_iso)" --file-filter='ISO | *.iso') || exit 0; fi
+  [ -s "$ISO" ] || { err "$(t iso_unreadable)"; exit 1; }
+  case "$ISO" in *.[iI][sS][oO]) ;; *) err "$(t iso_wrong_ext)"; exit 1;; esac
+  s=$(src_of -T "$ISO"); ISOD=""; [ -n "$s" ] && ISOD=$(disks_of "$s")
+fi
+mapfile -t C < <(pick "$mode")
+if [ "${#C[@]}" -eq 0 ]; then
+  if [ "$mode" = wipe ]; then
+    L=$(explain)
+    yn "$(t no_usb_wipe "$L")" || exit 0
+    mapfile -t C < <(pick all)
+    [ "${#C[@]}" -gt 0 ] || { err "$(t no_disks "$L")"; exit 0; }
+  else
+    err "$(t no_usb_flash "$(explain)")"; exit 0
+  fi
+fi
+args=(); for l in "${C[@]}"; do IFS='|' read -r p s m sr t kind why bytes <<<"$l"; args+=("$p" "$p  $s  ${m:-$(t unknown)}  [$(kindname "$kind")]"); done
+if [ $GUI = kdialog ]; then DEV=$(kdialog --title "$APP" --menu "$(t pick_target)" "${args[@]}") || exit 0
+else DEV=$(zenity --list --title="$APP" --column=id --column="$(t col_target)" --hide-column=1 --print-column=1 "${args[@]}") || exit 0; fi
+line=""; for l in "${C[@]}"; do [ "${l%%|*}" = "$DEV" ] && line=$l; done
+[ -n "$line" ] || { err "$(t dev_unconfirmed)"; exit 1; }
+IFS='|' read -r p s m SERIAL t KIND why BYTES <<<"$line"
+SIZE=$(blockdev --getsize64 "$DEV" 2>/dev/null || lsblk -bdno SIZE "$DEV")
+case "$SIZE" in ''|*[!0-9]*) SIZE=$(lsblk -bdno SIZE "$DEV" 2>/dev/null | head -n 1 | tr -dc 0-9);; esac
+case "$SIZE" in ''|0|*[!0-9]*) n=$(cat "/sys/block/${DEV##*/}/size" 2>/dev/null); [ -n "$n" ] && SIZE=$((n*512));; esac
+case "$SIZE" in ''|0|*[!0-9]*) SIZE=${BYTES:-};; esac
+case "$SIZE" in ''|0) err "$(t size_fail "$DEV")"; exit 1;; esac
+SERIAL_ARG=${SERIAL:--}   # pkexec は空の引数を落とすことがあるので、無いときは - を渡す
+mkdir -p "$HOME/.cache/tone-os" 2>/dev/null; LOG="$HOME/.cache/tone-os/usb-last.log"; : > "$LOG"
+notify() { command -v notify-send >/dev/null 2>&1 && notify-send -i drive-removable-media "$APP" "$1" 2>/dev/null; true; }
+WORKPID=""; KREF=""
+work_start() { # 処理中の表示(終わるまで出しておく。終わっても何も出ない、を防ぐ)
+  notify "$1"
+  if [ $GUI = zenity ]; then
+    ( n=0; while :; do l=$(tail -n 1 "$LOG" 2>/dev/null | tr -d '\r' | tlog | cut -c1-70); echo "# $(t progress_line "$1" "$n" "$l")"; n=$((n+2)); sleep 2; done ) | zenity --progress --pulsate --no-cancel --title="$APP" --width=480 --text="$1" >/dev/null 2>&1 &
+    WORKPID=$!
+  else
+    KREF=$(kdialog --title "$APP" --progressbar "$(t progress_keep "$1")" 0 2>/dev/null) || KREF=""
+  fi
+}
+work_stop() {
+  [ -n "$WORKPID" ] && { kill "$WORKPID" 2>/dev/null; WORKPID=""; }
+  if [ -n "$KREF" ]; then
+    local qd; for qd in qdbus qdbus6 qdbus-qt5; do command -v $qd >/dev/null 2>&1 && break; qd=""; done
+    # shellcheck disable=SC2086
+    [ -n "$qd" ] && $qd $KREF close >/dev/null 2>&1; KREF=""
+  fi
+}
+runroot() { work_start "$WORKMSG"; pkexec "$ROOT_HELPER" "$@" >"$LOG" 2>&1; local rc=$?; work_stop; return $rc; }
+done_ok() { notify "$1"; info "$1"; }
+done_ng() { notify "$(t failed_title)"; err "$(t failed_body "$(tail -n 8 "$LOG" | tlog)" "$LOG")"; }
+if [ "$mode" = flash ]; then
+  CN=""; [ $COMBO = 1 ] && CN=$(t combo_note)
+  yn "$(t flash_confirm "$ISO" "$DEV" "$s" "${m:-$(t unknown)}" "$CN")" || exit 0
+  WORKMSG=$(t work_flash); FOPT=()
+  [ $COMBO = 1 ] && { FOPT=(full eject); WORKMSG=$(t work_combo); }
+  runroot flash "$ISO" "$DEV" "$SIZE" "$SERIAL_ARG" "${FOPT[@]}"; rc=$?
+  if [ $rc = 0 ]; then
+    if [ $COMBO = 1 ]; then done_ok "$(t combo_done "$(grep -E '^@@M_(EJECTED|SYNCED|EJECT_MANUAL)' "$LOG" | tail -n 1 | tlog)")"
+    else done_ok "$(t flash_done)"; fi
+  else done_ng; fi
+else
+  QK=$(t how_quick); QF=$(t how_full)
+  lv=$( if [ $GUI = kdialog ]; then kdialog --title "$APP" --menu "$(t wipe_how)" quick "$QK" full "$QF"; else zenity --list --title="$APP" --column=id --column="$(t col_how)" --hide-column=1 --print-column=1 quick "$QK" full "$QF"; fi ) || exit 0
+  SRL=$(t serial_label "${SERIAL:-$(t none)}"); MD=${m:-$(t unknown)}
+  ANY=""
+  if [ "$KIND" = int ]; then   # 内蔵ディスク(USBではない)だけは、取り違えると取り返しがつかないので、デバイス名の全体を入力してもらう
+    ANY=any
+    ans=$(ask "$(t int_prompt "$DEV" "$s" "$MD" "$SRL")") || exit 0
+    [ "$ans" = "$DEV" ] || { err "$(t input_mismatch)"; exit 0; }
+  fi
+  yn "$(t wipe_confirm "$DEV" "$s" "$MD" "$SRL")" || exit 0
+  WORKMSG=$(t work_wipe); [ "$lv" = full ] && WORKMSG=$(t work_wipe_full)
+  runroot wipe "$DEV" "$lv" "$SIZE" "$SERIAL_ARG" $ANY; rc=$?
+  if [ $rc = 0 ]; then done_ok "$(t wipe_done)"; else done_ng; fi
+fi
+exit 0
